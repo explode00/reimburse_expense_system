@@ -110,7 +110,7 @@ def load_user():
 @app.context_processor
 def inject_globals():
     alerts_count = len(alert_reports_for(g.user['id'])) if getattr(g, 'user', None) and g.user['role']=='approver' else 0
-    return {"categories": CATEGORIES, "statuses": STATUSES, "stale_days": STALE_DAYS, "alerts_count": alerts_count}
+    return {"categories": CATEGORIES, "statuses": STATUSES, "stale_days": STALE_DAYS, "alert_reappear_days": ALERT_REAPPEAR_DAYS, "alerts_count": alerts_count}
 
 
 def db():
@@ -224,8 +224,13 @@ def transition(report_id, new_status, actor_id, reason=None):
     actor = query_one("SELECT id, role FROM users WHERE id=?", (actor_id,))
     if not actor:
         raise ValueError("Acting user does not exist.")
-    if new_status == "Submitted" and report["owner_id"] != actor_id:
-        raise ValueError("Only the report owner can submit this report.")
+    if new_status == "Submitted":
+        if report["owner_id"] != actor_id:
+            raise ValueError("Only the report owner can submit this report.")
+        if total_cents(report_id) <= 0:
+            raise ValueError("A report must contain at least one expense line before submission.")
+        if not query_one("SELECT 1 FROM report_approvers WHERE report_id=?", (report_id,)):
+            raise ValueError("Assign at least one eligible approver before submitting this report.")
     if new_status in {"Approved", "Rejected"}:
         if actor["role"] != "approver":
             raise ValueError("Only an approver can decide a submitted report.")
@@ -244,16 +249,26 @@ def transition(report_id, new_status, actor_id, reason=None):
             raise ValueError("You are not assigned as an eligible approver for this report.")
 
     ts = now_iso()
-    values = {"status": new_status, "updated_at": ts}
-    if new_status == "Submitted":
-        values["submitted_at"] = ts
-    elif new_status == "Approved":
-        values["approved_at"] = ts
-    elif new_status == "Paid":
-        values["paid_at"] = ts
-    set_clause = ", ".join(f"{k}=?" for k in values)
-    db().execute(f"UPDATE reports SET {set_clause} WHERE id=?", [*values.values(), report_id])
-    add_history(report_id, actor_id, "status_change", old, new_status, reason=reason)
+    if new_status == "Rejected":
+        # Rejection is a recorded decision, then immediately returns the report
+        # to Draft so the owner can correct and resubmit it. Both status changes
+        # are immutable history entries.
+        db().execute("UPDATE reports SET status='Draft', updated_at=?, submitted_at=NULL, approved_at=NULL WHERE id=?", (ts, report_id))
+        add_history(report_id, actor_id, "status_change", "Submitted", "Rejected", reason=reason)
+        add_history(report_id, actor_id, "status_change", "Rejected", "Draft", reason="Returned to draft after rejection")
+    else:
+        values = {"status": new_status, "updated_at": ts}
+        if new_status == "Submitted":
+            values["submitted_at"] = ts
+            values["approved_at"] = None
+            values["paid_at"] = None
+        elif new_status == "Approved":
+            values["approved_at"] = ts
+        elif new_status == "Paid":
+            values["paid_at"] = ts
+        set_clause = ", ".join(f"{k}=?" for k in values)
+        db().execute(f"UPDATE reports SET {set_clause} WHERE id=?", [*values.values(), report_id])
+        add_history(report_id, actor_id, "status_change", old, new_status, reason=reason)
     db().commit()
 
 
@@ -269,29 +284,30 @@ def validate_report_dates(title, start_date, end_date):
 def alert_reports_for(approver_id):
     cutoff = datetime.now(timezone.utc) - timedelta(days=STALE_DAYS)
     rows = query_all(
-        """SELECT r.*, u.email AS owner_email, MAX(h.created_at) AS latest_dismissed_at
+        """SELECT r.*, u.email AS owner_email
            FROM reports r
            JOIN users u ON u.id=r.owner_id
            JOIN report_approvers ra ON ra.report_id=r.id AND ra.approver_id=?
-           LEFT JOIN alert_dismissals d ON d.report_id=r.id AND d.approver_id=?
-           LEFT JOIN history h ON 1=0
            WHERE r.status='Submitted' AND r.submitted_at <= ?
-           GROUP BY r.id
            ORDER BY r.submitted_at ASC""",
-        (approver_id, approver_id, cutoff.isoformat()),
+        (approver_id, cutoff.isoformat()),
     )
     result = []
+    now = datetime.now(timezone.utc)
     for r in rows:
-        d = query_one("SELECT dismissed_at FROM alert_dismissals WHERE report_id=? AND approver_id=?", (r["id"], approver_id))
+        d = query_one(
+            "SELECT dismissed_at FROM alert_dismissals WHERE report_id=? AND approver_id=?",
+            (r["id"], approver_id),
+        )
         if not d:
             result.append(r)
-        else:
-            dismissed = datetime.fromisoformat(d["dismissed_at"])
-            submitted = datetime.fromisoformat(r["submitted_at"])
-            if dismissed + timedelta(days=ALERT_REAPPEAR_DAYS) <= datetime.now(timezone.utc):
-                # Never show a dismissal that predates a new submission after a resubmission.
-                if dismissed >= submitted:
-                    result.append(r)
+            continue
+        dismissed = datetime.fromisoformat(d["dismissed_at"])
+        submitted = datetime.fromisoformat(r["submitted_at"])
+        # A new submission starts a fresh alert cycle. Otherwise a dismissal
+        # suppresses the alert only for ALERT_REAPPEAR_DAYS.
+        if submitted > dismissed or dismissed + timedelta(days=ALERT_REAPPEAR_DAYS) <= now:
+            result.append(r)
     return result
 
 
@@ -320,24 +336,45 @@ def logout():
 @app.route("/")
 @login_required
 def dashboard():
+    scope = "WHERE 1=1" if g.user["role"] == "approver" else "WHERE owner_id=?"
+    scope_args = () if g.user["role"] == "approver" else (g.user["id"],)
     counts = {}
-    counts["awaiting"] = query_one("SELECT COUNT(*) c FROM reports WHERE status='Submitted'")["c"] if g.user["role"] == "approver" else query_one("SELECT COUNT(*) c FROM reports WHERE owner_id=? AND status='Submitted'", (g.user["id"],))["c"]
-    counts["due"] = query_one("SELECT COALESCE(SUM(total),0) total FROM (SELECT r.id, COALESCE((SELECT SUM(amount_cents) FROM expense_lines l WHERE l.report_id=r.id),0) total FROM reports r WHERE r.status='Approved')")["total"]
+    counts["awaiting"] = query_one(f"SELECT COUNT(*) c FROM reports {scope} AND status='Submitted'", scope_args)["c"]
+    counts["due"] = query_one(
+        f"SELECT COALESCE(SUM(t.total_cents),0) total FROM reports r LEFT JOIN (SELECT report_id,SUM(amount_cents) total_cents FROM expense_lines GROUP BY report_id) t ON t.report_id=r.id {scope.replace('owner_id', 'r.owner_id')} AND r.status='Approved'",
+        scope_args,
+    )["total"]
     week_start = (datetime.now(timezone.utc).date() - timedelta(days=datetime.now(timezone.utc).weekday())).isoformat()
-    counts["approved_week"] = query_one("SELECT COUNT(*) c FROM reports WHERE status IN ('Approved','Paid') AND approved_at >= ?", (week_start,))["c"]
-    counts["paid_week"] = query_one("SELECT COUNT(*) c FROM reports WHERE status='Paid' AND paid_at >= ?", (week_start,))["c"]
-    status_counts = query_all("SELECT status, COUNT(*) c FROM reports GROUP BY status ORDER BY status")
-    category_counts = query_all("SELECT category, COUNT(*) c FROM expense_lines GROUP BY category ORDER BY c DESC, category")
+    counts["approved_week"] = query_one(f"SELECT COUNT(*) c FROM reports {scope} AND approved_at >= ? AND status IN ('Approved','Paid')", (*scope_args, week_start))["c"]
+    counts["paid_week"] = query_one(f"SELECT COUNT(*) c FROM reports {scope} AND paid_at >= ? AND status='Paid'", (*scope_args, week_start))["c"]
+    status_counts = query_all(f"SELECT status, COUNT(*) c FROM reports {scope} GROUP BY status ORDER BY status", scope_args)
+    category_counts = query_all(
+        f"""SELECT l.category, COUNT(*) c, COALESCE(SUM(l.amount_cents),0) total_cents
+             FROM expense_lines l JOIN reports r ON r.id=l.report_id
+             {scope.replace('owner_id','r.owner_id')} GROUP BY l.category ORDER BY total_cents DESC, l.category""",
+        scope_args,
+    )
     eight_weeks = []
     today = datetime.now(timezone.utc).date()
     monday = today - timedelta(days=today.weekday())
     for i in range(7, -1, -1):
         start = monday - timedelta(weeks=i)
         end = start + timedelta(days=7)
-        row = query_one("SELECT COALESCE(SUM((SELECT SUM(amount_cents) FROM expense_lines l WHERE l.report_id=r.id)),0) total FROM reports r WHERE r.status='Paid' AND paid_at >= ? AND paid_at < ?", (start.isoformat(), end.isoformat()))
+        row = query_one(
+            f"SELECT COALESCE(SUM((SELECT SUM(amount_cents) FROM expense_lines l WHERE l.report_id=r.id)),0) total FROM reports r {scope.replace('owner_id','r.owner_id')} AND r.status='Paid' AND paid_at >= ? AND paid_at < ?",
+            (*scope_args, start.isoformat(), end.isoformat()),
+        )
         eight_weeks.append({"label": start.isoformat(), "total": row["total"]})
     alerts = alert_reports_for(g.user["id"]) if g.user["role"] == "approver" else []
-    return render_template("dashboard.html", counts=counts, status_counts=status_counts, category_counts=category_counts, eight_weeks=eight_weeks, alerts=alerts)
+    return render_template(
+        "dashboard.html",
+        counts=counts,
+        status_counts=status_counts,
+        category_counts=category_counts,
+        eight_weeks=eight_weeks,
+        alerts=alerts,
+        my_assignments=(query_one("SELECT COUNT(*) c FROM reports r JOIN report_approvers ra ON ra.report_id=r.id WHERE ra.approver_id=? AND r.status='Submitted'", (g.user["id"],))["c"] if g.user["role"]=='approver' else 0),
+    )
 
 
 @app.route("/reports")
@@ -349,6 +386,7 @@ def reports():
     status = request.args.get("status", "")
     owner_id = request.args.get("owner_id", "")
     approver_id = request.args.get("approver_id", "")
+    assigned = request.args.get("assigned", "")
     sort = request.args.get("sort", "submitted")
     direction = request.args.get("direction", "desc").lower()
     if direction not in {"asc", "desc"}:
@@ -383,6 +421,9 @@ def reports():
     if approver_id:
         where.append("EXISTS (SELECT 1 FROM report_approvers rax WHERE rax.report_id=r.id AND rax.approver_id=?)")
         args.append(approver_id)
+    if assigned == "me" and g.user["role"] == "approver":
+        where.append("EXISTS (SELECT 1 FROM report_approvers rax2 WHERE rax2.report_id=r.id AND rax2.approver_id=?)")
+        args.append(g.user["id"])
     where_sql = " AND ".join(where)
     base = f"""FROM reports r JOIN users ou ON ou.id=r.owner_id
               LEFT JOIN (SELECT report_id, SUM(amount_cents) total_cents FROM expense_lines GROUP BY report_id) t ON t.report_id=r.id
@@ -393,7 +434,7 @@ def reports():
         f"SELECT r.*, ou.email AS owner_email, COALESCE(t.total_cents,0) total_cents {base} ORDER BY {sort_sql} {direction} NULLS LAST, r.id DESC LIMIT ? OFFSET ?",
         [*args, per_page, offset],
     )
-    owners = query_all("SELECT id,email FROM users ORDER BY email")
+    owners = query_all("SELECT id,email FROM users WHERE id=? ORDER BY email", (g.user["id"],)) if g.user["role"]=="employee" else query_all("SELECT id,email FROM users ORDER BY email")
     approvers = query_all("SELECT id,email FROM users WHERE role='approver' ORDER BY email")
     return render_template("reports.html", reports=rows, owners=owners, approvers=approvers, total=total, page=page, per_page=per_page, filters=request.args)
 
@@ -416,7 +457,9 @@ def new_report():
 @app.route("/reports/<int:report_id>")
 @login_required
 def report_detail(report_id):
-    report = report_or_404(report_id)
+    report = query_one("SELECT r.*, u.email AS owner_email FROM reports r JOIN users u ON u.id=r.owner_id WHERE r.id=?", (report_id,))
+    if not report:
+        abort(404)
     require_report_view(report)
     lines = query_all("SELECT * FROM expense_lines WHERE report_id=? ORDER BY expense_date, id", (report_id,))
     assignments = query_all("SELECT u.id,u.email FROM report_approvers ra JOIN users u ON u.id=ra.approver_id WHERE ra.report_id=? ORDER BY u.email", (report_id,))
@@ -461,6 +504,9 @@ def archive_report(report_id):
     report = report_or_404(report_id)
     if report["owner_id"] != g.user["id"]:
         abort(403)
+    if report["status"] in {"Submitted", "Approved"}:
+        flash("Active reports cannot be archived while they are awaiting a decision or payment.", "error")
+        return redirect(url_for("report_detail", report_id=report_id))
     db().execute("UPDATE reports SET archived=1,updated_at=? WHERE id=?", (now_iso(), report_id))
     db().commit()
     flash("Report archived.", "ok")
@@ -619,6 +665,12 @@ def bulk_action():
     results = []
     target = "Approved" if action == "approve" else "Rejected" if action == "reject" else None
     reason = request.form.get("reason", "").strip() or None
+    if not report_ids:
+        session["bulk_results"] = [("—", "No reports were selected.")]
+        return redirect(url_for("reports"))
+    if target == "Rejected" and not reason:
+        session["bulk_results"] = [(rid, "refused: A rejection reason is required for bulk rejection.") for rid in report_ids]
+        return redirect(url_for("reports"))
     if not target:
         flash("Unsupported bulk action.", "error")
         return redirect(url_for("reports"))

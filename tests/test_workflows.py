@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.NamedTemporaryFile(delete=False)
@@ -12,9 +13,10 @@ class WorkflowTests(unittest.TestCase):
         import app as appmod
         self.appmod = importlib.reload(appmod)
         self.appmod.init_db()
-        self.appmod.seed_demo()
+        with self.appmod.app.app_context():
+            self.appmod.seed_demo()
         self.client = self.appmod.app.test_client()
-        self.client.post('/login', data={'email':'employee@example.com','password':'password'})
+        self.login('employee@example.com')
         self.employee = self.appmod.query_one("SELECT * FROM users WHERE email='employee@example.com'")
         self.approver = self.appmod.query_one("SELECT * FROM users WHERE email='approver@example.com'")
         self.approver2 = self.appmod.query_one("SELECT * FROM users WHERE email='approver2@example.com'")
@@ -25,43 +27,60 @@ class WorkflowTests(unittest.TestCase):
 
     def login(self, email):
         self.client.get('/logout')
-        return self.client.post('/login', data={'email':email,'password':'password'})
+        return self.client.post('/login', data={'email': email, 'password': 'password'})
 
-    def make_report(self):
-        r=self.client.post('/reports/new', data={'title':'Trip','start_date':'2026-08-25','end_date':'2026-08-27'}, follow_redirects=True)
-        self.client.post('/reports/1/lines/add', data={'expense_date':'2026-08-25','amount':'12.50','category':'Meals','description':'Lunch'})
-        return r
+    def make_report(self, owner='employee@example.com', title='Trip'):
+        self.login(owner)
+        self.client.post('/reports/new', data={'title': title, 'start_date': '2026-08-25', 'end_date': '2026-08-27'})
+        report_id = self.appmod.query_one('SELECT MAX(id) id FROM reports')['id']
+        self.client.post(f'/reports/{report_id}/lines/add', data={'expense_date': '2026-08-25', 'amount': '12.50', 'category': 'Meals', 'description': 'Lunch'})
+        return report_id
+
+    def assign(self, report_id, *approver_ids):
+        self.login('approver@example.com')
+        self.client.post(f'/reports/{report_id}/assign', data=[('approver_ids', str(i)) for i in approver_ids])
 
     def test_total_is_server_computed(self):
-        self.make_report()
-        row=self.appmod.query_one('SELECT * FROM reports WHERE id=1')
-        self.assertEqual(self.appmod.total_cents(row['id']),1250)
-        self.assertEqual(self.client.get('/api/reports/1/total').json['total_cents'],1250)
+        report_id = self.make_report()
+        self.assign(report_id, self.approver['id'])
+        self.login('employee@example.com')
+        row = self.appmod.query_one('SELECT * FROM reports WHERE id=?', (report_id,))
+        self.assertEqual(self.appmod.total_cents(row['id']), 1250)
+        self.assertEqual(self.client.get(f'/api/reports/{report_id}/total').json['total_cents'], 1250)
 
     def test_self_approval_is_refused(self):
-        self.make_report(); self.client.post('/reports/1/submit')
+        report_id = self.make_report(owner='approver@example.com', title='Approver trip')
+        self.assign(report_id, self.approver['id'], self.approver2['id'])
         self.login('approver@example.com')
-        self.client.post('/reports/1/assign', data={'approver_ids':str(self.approver['id'])})
-        resp=self.client.post('/reports/1/decide', data={'action':'approve'}, follow_redirects=True)
+        self.client.post(f'/reports/{report_id}/submit')
+        resp = self.client.post(f'/reports/{report_id}/decide', data={'action': 'approve'}, follow_redirects=True)
         self.assertIn('You cannot approve or reject a report you own', resp.get_data(as_text=True))
+        row = self.appmod.query_one('SELECT status FROM reports WHERE id=?', (report_id,))
+        self.assertEqual(row['status'], 'Submitted')
 
     def test_rejection_returns_to_draft_with_reason(self):
-        self.make_report(); self.client.post('/reports/1/submit')
+        report_id = self.make_report()
+        self.assign(report_id, self.approver['id'])
+        self.login('employee@example.com')
+        self.client.post(f'/reports/{report_id}/submit')
         self.login('approver@example.com')
-        self.client.post('/reports/1/assign', data={'approver_ids':str(self.approver['id'])})
-        self.client.post('/reports/1/decide', data={'action':'reject','reason':'Missing receipt'})
-        row=self.appmod.query_one('SELECT * FROM reports WHERE id=1')
-        self.assertEqual(row['status'],'Draft')
-        h=self.appmod.query_one("SELECT * FROM history WHERE report_id=1 AND event_type='status_change' ORDER BY id DESC")
-        self.assertEqual(h['reason'],'Missing receipt')
+        self.client.post(f'/reports/{report_id}/decide', data={'action': 'reject', 'reason': 'Missing receipt'})
+        row = self.appmod.query_one('SELECT * FROM reports WHERE id=?', (report_id,))
+        self.assertEqual(row['status'], 'Draft')
+        history = self.appmod.query_all("SELECT old_status,new_status,reason FROM history WHERE report_id=? AND event_type='status_change' ORDER BY id", (report_id,))
+        self.assertEqual(history[-2]['old_status'], 'Submitted')
+        self.assertEqual(history[-2]['new_status'], 'Rejected')
+        self.assertEqual(history[-2]['reason'], 'Missing receipt')
+        self.assertEqual(history[-1]['new_status'], 'Draft')
 
-    def test_bulk_reports_each_get_individual_result(self):
-        self.make_report(); self.client.post('/reports/1/submit')
+    def test_bulk_reports_each_get_individual_result_for_self_owned_report(self):
+        report_id = self.make_report(owner='approver@example.com', title='Own report')
+        self.assign(report_id, self.approver['id'])
         self.login('approver@example.com')
-        self.client.post('/reports/1/assign', data={'approver_ids':str(self.approver['id'])})
-        # Create a second report owned by employee is not needed: selected report must still be processed individually.
-        resp=self.client.post('/reports/bulk', data=[('action','approve'),('report_ids','1')], follow_redirects=True)
+        self.client.post(f'/reports/{report_id}/submit')
+        resp = self.client.post('/reports/bulk', data=[('action', 'approve'), ('report_ids', str(report_id))], follow_redirects=True)
         self.assertIn('refused: You cannot approve or reject a report you own', resp.get_data(as_text=True))
+
 
 if __name__ == '__main__':
     unittest.main()
